@@ -3,10 +3,14 @@
 #Thomas Flayols - feb 2022
 #https://github.com/thomasfla/odri-spi-rpi
 #https://github.com/open-dynamic-robot-initiative/master-board/blob/master/documentation/BLMC_%C2%B5Driver_SPI_interface.md
+import copy
 import struct
 import spidev
 import RPi.GPIO as GPIO
 import spidev
+
+from itertools import chain
+
 from math import pi
 import time
 def crc32(buf):
@@ -25,6 +29,7 @@ def checkcrc(buf):
 
 class SPIuDriver:
   def __init__(self, waitForInit = True, absolutePositionMode = False, offsets=[0.0,0.0]):
+    self.connected_boards = 1
 
     #Configure CS pin
     GPIO.setmode(GPIO.BCM)
@@ -60,21 +65,20 @@ class SPIuDriver:
 
     self.EI1OC = 1 if absolutePositionMode else 0
     self.EI2OC = 1 if absolutePositionMode else 0
-    self.refPosition0 = 0
-    self.refPosition1= 0
-    self.refVelocity0= 0
-    self.refVelocity1= 0
-    self.refCurrent0= 0
-    self.refCurrent1= 0
+
     self.iSatCurrent0= 5.0
     self.iSatCurrent1= 5.0
-    self.kp0= 0
-    self.kp1= 0
-    self.kd0= 0
-    self.kd1= 0
-    self.timeout = 20
 
+    self.alpha = [
+       [0., 0., 0., 0.],
+       [0., 0., 0., 0.]
+    ]
+
+    self.beta = [0., 0.]
+    
+    self.timeout = 20
     self.error = -1
+
     #wait for system enable
     if waitForInit:
       print(">> Calibrating motor, please wait")
@@ -96,8 +100,25 @@ class SPIuDriver:
                 displayedIndex1 = True
             time.sleep(0.001)
     print ("ready!")
-  def transfer(self):
 
+  @property
+  def alpha(self):
+    return self._alpha
+  
+  @alpha.setter
+  def alpha(self, arr):
+    self._alpha = copy.deepcopy(arr)
+
+    # A / rad, 2^-11 LSB, 16 bit signed:
+    fixed_point = [
+      int(a * (1 << 11)) 
+      for a in chain.from_iterable(self._alpha)
+    ]
+
+    assert len(fixed_point) == 2 * (4 * self.connected_boards)  
+    self._encoded_alpha = struct.pack(f">{len(fixed_point)}h", *fixed_point)    
+
+  def transfer(self):
     #generate command packet
     ES = 1
     EM1 = 1	
@@ -107,31 +128,54 @@ class SPIuDriver:
     EI2OC	= self.EI2OC
     mode = (ES << 7) | (EM1 << 6) | (EM2<<5)|(EPRE<<4)|(EI1OC<<3)|(EI2OC<<2)
     timeout = self.timeout
-    rawRefPos0 = int((self.refPosition0-self.offset0)/(2.*pi)*(1<<24) )
-    rawRefPos1 = int((self.refPosition1-self.offset1)/(2.*pi)*(1<<24))
-    rawRefVel0 = int(self.refVelocity0*(1<<11)*60.0/(2000*pi))
-    rawRefVel1 = int(self.refVelocity1*(1<<11)*60.0/(2000*pi))
-    rawRefIq0 = int(self.refCurrent0*(1<<10))
-    rawRefIq1 = int(self.refCurrent1*(1<<10))
+
     rawIsat0 = int(self.iSatCurrent0*(1<<3))
     rawIsat1 = int(self.iSatCurrent1*(1<<3))
-    rawKp0 = int(self.kp0*(1<<11)*(2*pi) )
-    rawKp1 = int(self.kp1*(1<<11)*(2*pi) )
-    rawKd0 = int(self.kd0*(1<<10)*(2*pi*1000./60.0) )
-    rawKd1 = int(self.kd1*(1<<10)*(2*pi*1000./60.0) )
-    commandPacket = bytearray(struct.pack(">BBiihhhhHHHHBBHI",mode,timeout,rawRefPos0,rawRefPos1,rawRefVel0,rawRefVel1,rawRefIq0,rawRefIq1,rawKp0,rawKp1,rawKd0,rawKd1, rawIsat0, rawIsat1, 0,0))
+
+    rawBeta0  = int(self.beta[0] * (1 << 10))
+    rawBeta1  = int(self.beta[1] * (1 << 10))
+    
+    commandPacket = bytearray(
+      struct.pack(
+        f">BB{len(self._encoded_alpha)}s2hBBH HH I",
+        
+        # Mode 16 bits:
+        mode,
+        timeout,
+
+        # Linear control parameters:
+        self._encoded_alpha,
+        rawBeta0,
+        rawBeta1,
+
+        # Saturation current uint16_t:
+        rawIsat0,
+        rawIsat1,
+
+        # index (uint16_t):
+        0,
+
+        # 4 bytes padding to make sure sizeof(cmd_packet) >= sizeof(sensor_packet):
+        0, 0,
+
+        # Temporary CRC (uint32_t):
+        0
+      )
+    )
+
+
     crc=crc32(commandPacket[:-4])
     commandPacket[-4]=(crc>>24)&0xff
     commandPacket[-3]=(crc>>16)&0xff
     commandPacket[-2]=(crc>>8)&0xff
     commandPacket[-1]=(crc)&0xff
+
     GPIO.output(25,0) #enable CS
     sensorPacket = bytearray(self.spi.xfer(commandPacket))
     GPIO.output(25,1) #disable CS
-    #print(commandPacket.hex(),checkcrc(commandPacket))
-    #print(sensorPacket.hex(),checkcrc(sensorPacket))
+
     if checkcrc(sensorPacket):
-    #decode received sensor packet
+      #decode received sensor packet
       data = struct.unpack(">H H i i h h h h xxxxxxxxxxxxxx",sensorPacket)
       self.is_system_enabled        = data[0]&0b1000000000000000 != 0
       self.is_enabled0              = data[0]&0b0100000000000000 != 0
@@ -155,48 +199,48 @@ class SPIuDriver:
     if (self.error!=0):
         raise(Exception(f"Error from motor driver: Error {self.error}"))
     #print(sensorPacket.hex())
-  def goto(self,p0,p1):
-        Kp = 3.0
-        Kd = 0.06
-        Ki = 0*50
-        pid0 = PID(Kp,Ki,Kd)
-        pid1 = PID(Kp,Ki,Kd)
-        p0_start = self.position0
-        p1_start = self.position1
-        eps = 0.01
-        dt=0.001
-        T=1000
-        t = time.perf_counter()
-        for i in range(T):
-            goalPosition0 = (i/T) * p0 + (1 - i/T) * p0_start
-            goalPosition1 = (i/T) * p1 + (1 - i/T) * p1_start
-            self.transfer() #transfer
-            #self.refCurrent0 = 1.0*(goalPosition0-self.position0)-0.1*self.velocity0
-            #self.refCurrent1 = 1.0*(goalPosition1-self.position1)-0.1*self.velocity1
-            self.refCurrent0 = pid0.compute(self.position0,self.velocity0,goalPosition0,0.0)
-            self.refCurrent1 = pid1.compute(self.position1,self.velocity1,goalPosition1,0.0)
-            #wait for next control cycle
-            t +=dt
-            while(time.perf_counter()-t<dt):
-                pass
-        self.refCurrent0 = 0
-        self.refCurrent1 = 0
-        self.transfer()
+  # def goto(self,p0,p1):
+  #       Kp = 3.0
+  #       Kd = 0.06
+  #       Ki = 0*50
+  #       pid0 = PID(Kp,Ki,Kd)
+  #       pid1 = PID(Kp,Ki,Kd)
+  #       p0_start = self.position0
+  #       p1_start = self.position1
+  #       eps = 0.01
+  #       dt=0.001
+  #       T=1000
+  #       t = time.perf_counter()
+  #       for i in range(T):
+  #           goalPosition0 = (i/T) * p0 + (1 - i/T) * p0_start
+  #           goalPosition1 = (i/T) * p1 + (1 - i/T) * p1_start
+  #           self.transfer() #transfer
+  #           #self.refCurrent0 = 1.0*(goalPosition0-self.position0)-0.1*self.velocity0
+  #           #self.refCurrent1 = 1.0*(goalPosition1-self.position1)-0.1*self.velocity1
+  #           self.refCurrent0 = pid0.compute(self.position0,self.velocity0,goalPosition0,0.0)
+  #           self.refCurrent1 = pid1.compute(self.position1,self.velocity1,goalPosition1,0.0)
+  #           #wait for next control cycle
+  #           t +=dt
+  #           while(time.perf_counter()-t<dt):
+  #               pass
+  #       self.refCurrent0 = 0
+  #       self.refCurrent1 = 0
+  #       self.transfer()
   def stop(self):
         self.EI1OC = 0
         self.EI2OC = 0
-        self.refPosition0 = 0
-        self.refPosition1= 0
-        self.refVelocity0= 0
-        self.refVelocity1= 0
-        self.refCurrent0= 0
-        self.refCurrent1= 0
+        # self.refPosition0 = 0
+        # self.refPosition1= 0
+        # self.refVelocity0= 0
+        # self.refVelocity1= 0
+        # self.refCurrent0= 0
+        # self.refCurrent1= 0
         self.iSatCurrent0= 0
         self.iSatCurrent1= 0
-        self.kp0= 0
-        self.kp1= 0
-        self.kd0= 0
-        self.kd1= 0
+        # self.kp0= 0
+        # self.kp1= 0
+        # self.kd0= 0
+        # self.kd1= 0
         self.timeout = 0
         dt=0.001
         t = time.perf_counter()
