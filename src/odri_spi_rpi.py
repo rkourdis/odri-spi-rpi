@@ -28,8 +28,8 @@ def checkcrc(buf):
   return False
 
 class SPIuDriver:
-  def __init__(self, waitForInit = True, absolutePositionMode = False, offsets=[0.0,0.0]):
-    self.connected_boards = 1
+  def __init__(self, connected_boards = 1, waitForInit = True, absolutePositionMode = False, offsets=[0.0,0.0]):
+    self.connected_boards = connected_boards
 
     #Configure CS pin
     GPIO.setmode(GPIO.BCM)
@@ -69,13 +69,9 @@ class SPIuDriver:
     self.iSatCurrent0= 5.0
     self.iSatCurrent1= 5.0
 
-    self.alpha = [
-       [0., 0., 0., 0.],
-       [0., 0., 0., 0.]
-    ]
-
+    self.alpha = [[0.] * (4 * self.connected_boards)] * 2
     self.beta = [0., 0.]
-    
+   
     self.timeout = 20
     self.error = -1
 
@@ -135,10 +131,7 @@ class SPIuDriver:
     rawBeta0  = int(self.beta[0] * (1 << 10))
     rawBeta1  = int(self.beta[1] * (1 << 10))
     
-    commandPacket = bytearray(
-      struct.pack(
-        f">BB{len(self._encoded_alpha)}s2hBBH HH I",
-        
+    values = [
         # Mode 16 bits:
         mode,
         timeout,
@@ -154,12 +147,19 @@ class SPIuDriver:
 
         # index (uint16_t):
         0,
+     ]
+    
+    # 4 bytes padding to make sure sizeof(cmd_packet) >= sizeof(sensor_packet):
+    if self.connected_boards == 1:
+        values += [0, 0]
+    
+    # Temporary CRC (uint32_t):
+    values += [0,]
 
-        # 4 bytes padding to make sure sizeof(cmd_packet) >= sizeof(sensor_packet):
-        0, 0,
-
-        # Temporary CRC (uint32_t):
-        0
+    commandPacket = bytearray(
+      struct.pack(
+        f">BB{len(self._encoded_alpha)}s2hBBH {'HH' if self.connected_boards == 1 else ''} I",
+        *values
       )
     )
 
@@ -170,8 +170,10 @@ class SPIuDriver:
     commandPacket[-2]=(crc>>8)&0xff
     commandPacket[-1]=(crc)&0xff
 
+    # Trim sensor packet to 17 words due to the fact that the SPI TX buffer
+    # is limited and bytes sent after (because the command is larger) will be garbage: 
     GPIO.output(25,0) #enable CS
-    sensorPacket = bytearray(self.spi.xfer(commandPacket))
+    sensorPacket = bytearray(self.spi.xfer(commandPacket))[:34]
     GPIO.output(25,1) #disable CS
 
     if checkcrc(sensorPacket):
@@ -229,6 +231,8 @@ class SPIuDriver:
   def stop(self):
         self.EI1OC = 0
         self.EI2OC = 0
+        self.alpha = [[0]*4]*2
+        self.beta  = [0]*2
         # self.refPosition0 = 0
         # self.refPosition1= 0
         # self.refVelocity0= 0
