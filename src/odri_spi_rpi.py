@@ -3,42 +3,44 @@
 #Thomas Flayols - feb 2022
 #https://github.com/thomasfla/odri-spi-rpi
 #https://github.com/open-dynamic-robot-initiative/master-board/blob/master/documentation/BLMC_%C2%B5Driver_SPI_interface.md
+
+# Modified for linear control and multiple SPIs - Rafael Kourdis
+
 import copy
+import time
 import struct
 import spidev
-import RPi.GPIO as GPIO
-import spidev
-
-from itertools import chain
 
 from math import pi
-import time
+from itertools import chain
+
 def crc32(buf):
   crc=0xffffffff
+
   for val in buf:
     crc ^= val << 24
     for _ in range(8):
       crc = crc << 1 if (crc & 0x80000000) == 0 else (crc << 1) ^ 0x104c11db7
+  
   return crc
 
 def checkcrc(buf):
   crc = crc32(buf[:-4])
-  if (crc&0xffff == buf[-4]*256+buf[-3] and (crc&0xFFFF0000)>>16 == buf[-2]*256+buf[-1] ): #todo, clean
-    return True
-  return False
+  return (crc & 0xffff == buf[-4] * 256 + buf[-3] and (crc & 0xffff0000) >> 16 == buf[-2] * 256 + buf[-1])
 
 class SPIuDriver:
-  def __init__(self, connected_boards = 1, waitForInit = True, absolutePositionMode = False, offsets=[0.0,0.0]):
+  def __init__(self, connected_boards = 1, waitForInit = True, absolutePositionMode = False, spi_bus = 0):
     self.connected_boards = connected_boards
 
-    #Configure CS pin
-    GPIO.setmode(GPIO.BCM)
-    GPIO.setup(25,GPIO.OUT)
-    GPIO.output(25,0)
+    # On RPi5, we have to use https://github.com/waveform80/rpi-lgpio
+    # instead of RPi.GPIO.
+    
+    # We rely on the hardware for CS. It seems that the delay for the uDriver DMA
+    # to transfer the sensor packet is enough.
 
     #Initialise SPI
     self.spi = spidev.SpiDev()
-    self.spi.open(0, 0)
+    self.spi.open(spi_bus, 0)
     self.spi.mode=0
     self.spi.max_speed_hz = 8000000
 
@@ -60,62 +62,47 @@ class SPIuDriver:
     self.index_toggle_bit0 = 0
     self.index_toggle_bit1 = 0
 
-    self.offset0 = offsets[0]
-    self.offset1 = offsets[1]
-
     self.EI1OC = 1 if absolutePositionMode else 0
     self.EI2OC = 1 if absolutePositionMode else 0
 
-    self.iSatCurrent0= 5.0
-    self.iSatCurrent1= 5.0
+    self.iSatCurrent0 = 5.0
+    self.iSatCurrent1 = 5.0
 
-    self.alpha = [[0.] * (4 * self.connected_boards)] * 2
+    self.alpha = [0.] * (2 * 4 * self.connected_boards)
     self.beta = [0., 0.]
    
-    self.timeout = 20
+    self.timeout = 0
     self.error = -1
 
-    #wait for system enable
+    # Wait for system enable:
     if waitForInit:
       print(">> Calibrating motor, please wait")
       while(not self.is_ready0):
         self.transfer()
         time.sleep(0.001)
+    
     if absolutePositionMode:
       if (not self.has_index_been_detected0 or not self.has_index_been_detected1):
           print(">> Waiting for index pulse to have absolute position reference, please move the motors manualy")
           displayedIndex0 = False
           displayedIndex1 = False
+          
           while(not self.has_index_been_detected0 or not self.has_index_been_detected1):
             self.transfer()
             if self.has_index_been_detected0 == True and displayedIndex0 == False:
-                print (" >> Index 0 detected !")
+                print (" >> Index 0 detected!")
                 displayedIndex0 = True
+
             if self.has_index_been_detected1 == True and displayedIndex1 == False:
-                print (" >> Index 1 detected !")
+                print (" >> Index 1 detected!")
                 displayedIndex1 = True
+            
             time.sleep(0.001)
-    print ("ready!")
 
-  @property
-  def alpha(self):
-    return self._alpha
-  
-  @alpha.setter
-  def alpha(self, arr):
-    self._alpha = copy.deepcopy(arr)
-
-    # A / rad, 2^-11 LSB, 16 bit signed:
-    fixed_point = [
-      int(a * (1 << 11)) 
-      for a in chain.from_iterable(self._alpha)
-    ]
-
-    assert len(fixed_point) == 2 * (4 * self.connected_boards)  
-    self._encoded_alpha = struct.pack(f">{len(fixed_point)}h", *fixed_point)    
+    print ("Ready!")
 
   def transfer(self):
-    #generate command packet
+    # Generate command packet
     ES = 1
     EM1 = 1	
     EM2	= 1
@@ -125,45 +112,48 @@ class SPIuDriver:
     mode = (ES << 7) | (EM1 << 6) | (EM2<<5)|(EPRE<<4)|(EI1OC<<3)|(EI2OC<<2)
     timeout = self.timeout
 
-    rawIsat0 = int(self.iSatCurrent0*(1<<3))
-    rawIsat1 = int(self.iSatCurrent1*(1<<3))
+    rawIsat0 = int(self.iSatCurrent0 * (1 << 3))
+    rawIsat1 = int(self.iSatCurrent1 * (1 << 3))
 
     rawBeta0  = int(self.beta[0] * (1 << 10))
     rawBeta1  = int(self.beta[1] * (1 << 10))
-    
-    values = [
-        # Mode 16 bits:
+
+    header_values = [
+        # Mode + Timeout 16 bits:
         mode,
         timeout,
 
-        # Linear control parameters:
-        self._encoded_alpha,
-        rawBeta0,
-        rawBeta1,
-
-        # Saturation current uint16_t:
+        # Saturation current 0 + 1 uint16_t:
         rawIsat0,
         rawIsat1,
 
-        # index (uint16_t):
+        # Index (uint16_t):
         0,
      ]
-    
-    # 4 bytes padding to make sure sizeof(cmd_packet) >= sizeof(sensor_packet):
-    if self.connected_boards == 1:
-        values += [0, 0]
-    
-    # Temporary CRC (uint32_t):
-    values += [0,]
 
-    commandPacket = bytearray(
-      struct.pack(
-        f">BB{len(self._encoded_alpha)}s2hBBH {'HH' if self.connected_boards == 1 else ''} I",
-        *values
-      )
+    # We pack these values in big-endian *byte* mode. The C2000
+    # is little-endian, but for _words_ of 16 bits. The header does
+    # not contain any 32 bit values. 
+    header_bytes = struct.pack("> BB BB H", *header_values)
+
+    # Floats should be packed in big-endian byte mode,
+    # but we'll need to manually flip the words so that we get
+    # them in little-endian word mode:
+    floats = self.alpha + self.beta
+    
+    floats_bytes = struct.pack(f"> {2 * 4 * self.connected_boards + 2}f", *floats)
+    floats_word_swapped = b''.join(
+      floats_bytes[f_idx*4 + 2 : f_idx*4 + 4] + floats_bytes[f_idx*4 + 0 : f_idx*4 + 2]
+      for f_idx in range(len(floats))
     )
 
-
+    commandPacket = bytearray(
+      header_bytes +
+      b'\x00' * (len(header_bytes) % 4) +  # 32-bit values are aligned on 32-bit boundaries
+      floats_word_swapped +
+      struct.pack(f"I", 0)               # Temporary CRC (uint32_t)
+    )
+    
     crc=crc32(commandPacket[:-4])
     commandPacket[-4]=(crc>>24)&0xff
     commandPacket[-3]=(crc>>16)&0xff
@@ -172,109 +162,54 @@ class SPIuDriver:
 
     # Trim sensor packet to 17 words due to the fact that the SPI TX buffer
     # is limited and bytes sent after (because the command is larger) will be garbage: 
-    GPIO.output(25,0) #enable CS
     sensorPacket = bytearray(self.spi.xfer(commandPacket))[:34]
-    GPIO.output(25,1) #disable CS
 
-    if checkcrc(sensorPacket):
-      #decode received sensor packet
-      data = struct.unpack(">H H i i h h h h xxxxxxxxxxxxxx",sensorPacket)
-      self.is_system_enabled        = data[0]&0b1000000000000000 != 0
-      self.is_enabled0              = data[0]&0b0100000000000000 != 0
-      self.is_ready0                = data[0]&0b0010000000000000 != 0
-      self.is_enabled1              = data[0]&0b0001000000000000 != 0
-      self.is_ready1                = data[0]&0b0000100000000000 != 0
-      self.has_index_been_detected0 = data[0]&0b0000010000000000 != 0
-      self.has_index_been_detected1 = data[0]&0b0000001000000000 != 0
+    # print("Command: ", " ".join(format(x, "02x") for x in commandPacket))
+    # print("Sensor:  ", " ".join(format(x, "02x") for x in sensorPacket))
+    # print(checkcrc(sensorPacket))
+    # print()
 
-      self.error             = data[0]&0b0000000000001111
-      self.position0 = data[2] / (1<<24) * 2.0 * pi + self.offset0
-      self.position1 = data[3] / (1<<24) * 2.0 * pi + self.offset1
-      self.velocity0 = data[4] / (1<<11) * 2000*pi/60.0
-      self.velocity1 = data[5] / (1<<11) * 2000*pi/60.0
-      self.current0 = data[6]  / (1<<10)
-      self.current1 = data[7]  / (1<<10)
-      #print("velocity =", self.velocity0)
-      #print("cur =", self.current0)
-    else:
-        raise(Exception(f"Error: sensor frame is corrupted is uDriver powered on?"))
-    if (self.error!=0):
-        raise(Exception(f"Error from motor driver: Error {self.error}"))
-    #print(sensorPacket.hex())
-  # def goto(self,p0,p1):
-  #       Kp = 3.0
-  #       Kd = 0.06
-  #       Ki = 0*50
-  #       pid0 = PID(Kp,Ki,Kd)
-  #       pid1 = PID(Kp,Ki,Kd)
-  #       p0_start = self.position0
-  #       p1_start = self.position1
-  #       eps = 0.01
-  #       dt=0.001
-  #       T=1000
-  #       t = time.perf_counter()
-  #       for i in range(T):
-  #           goalPosition0 = (i/T) * p0 + (1 - i/T) * p0_start
-  #           goalPosition1 = (i/T) * p1 + (1 - i/T) * p1_start
-  #           self.transfer() #transfer
-  #           #self.refCurrent0 = 1.0*(goalPosition0-self.position0)-0.1*self.velocity0
-  #           #self.refCurrent1 = 1.0*(goalPosition1-self.position1)-0.1*self.velocity1
-  #           self.refCurrent0 = pid0.compute(self.position0,self.velocity0,goalPosition0,0.0)
-  #           self.refCurrent1 = pid1.compute(self.position1,self.velocity1,goalPosition1,0.0)
-  #           #wait for next control cycle
-  #           t +=dt
-  #           while(time.perf_counter()-t<dt):
-  #               pass
-  #       self.refCurrent0 = 0
-  #       self.refCurrent1 = 0
-  #       self.transfer()
+    if not checkcrc(sensorPacket):
+      raise Exception(f"Error: Corrupted sensor frame - is uDriver powered on?")
+
+    # Decode received sensor packet
+    data = struct.unpack(">H H i i h h h h xxxxxxxxxxxxxx", sensorPacket)
+    self.is_system_enabled        = data[0]&0b1000000000000000 != 0
+    self.is_enabled0              = data[0]&0b0100000000000000 != 0
+    self.is_ready0                = data[0]&0b0010000000000000 != 0
+    self.is_enabled1              = data[0]&0b0001000000000000 != 0
+    self.is_ready1                = data[0]&0b0000100000000000 != 0
+    self.has_index_been_detected0 = data[0]&0b0000010000000000 != 0
+    self.has_index_been_detected1 = data[0]&0b0000001000000000 != 0
+
+    self.error             = data[0]&0b0000000000001111
+    self.position0 = data[2] / (1<<24) * 2.0 * pi
+    self.position1 = data[3] / (1<<24) * 2.0 * pi
+    self.velocity0 = data[4] / (1<<11) * 2000*pi/60.0
+    self.velocity1 = data[5] / (1<<11) * 2000*pi/60.0
+    self.current0 = data[6]  / (1<<10)
+    self.current1 = data[7]  / (1<<10)
+    
+    if self.error!=0:
+        raise Exception(f"Error from motor driver: Error {self.error}")
+   
   def stop(self):
         self.EI1OC = 0
         self.EI2OC = 0
-        self.alpha = [[0]*4]*2
-        self.beta  = [0]*2
-        # self.refPosition0 = 0
-        # self.refPosition1= 0
-        # self.refVelocity0= 0
-        # self.refVelocity1= 0
-        # self.refCurrent0= 0
-        # self.refCurrent1= 0
-        self.iSatCurrent0= 0
-        self.iSatCurrent1= 0
-        # self.kp0= 0
-        # self.kp1= 0
-        # self.kd0= 0
-        # self.kd1= 0
+
+        self.alpha = [0.] * (2 * 4 * self.connected_boards)
+        self.beta = [0., 0.]
+   
+        self.iSatCurrent0 = 0
+        self.iSatCurrent1 = 0
         self.timeout = 0
+
         dt=0.001
         t = time.perf_counter()
-        for i in range(100):
-            self.transfer() #transfer
-            #wait for next control cycle
-            t +=dt
-            while(time.perf_counter()-t<dt):
-                pass
 
-class PID:
-    def __init__(self,Kp,Ki,Kd, sat = 2.0, dt=0.001):
-        self.Kp=Kp
-        self.Ki=Ki
-        self.Kd=Kd
-        self.sat = sat
-        self.u = 0.0
-        self.ierr = 0.0
-        self.dt = dt
-    def compute(self, p, v, p_ref=0.0, v_ref=0.0):
-        perr = p_ref-p
-        verr = v_ref-v
-        self.ierr = self.ierr + perr * self.dt
-        if (self.ierr > self.sat) :
-            self.ierr = self.sat
-        if (self.ierr < -self.sat) :
-            self.ierr = -self.sat
-        self.u = self.Kp * perr + self.Kd * verr + self.Ki * self.ierr
-        if (self.u > self.sat) :
-            self.u = self.sat
-        if (self.u < -self.sat) :
-            self.u = -self.sat
-        return self.u
+        for _ in range(2):
+            self.transfer()
+            
+            t += dt
+            while(time.perf_counter() < t):
+                pass
