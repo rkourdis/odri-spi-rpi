@@ -47,26 +47,17 @@ class SPIuDriver:
     # Allocate all variables
     self.is_system_enabled = 0
     self.error_code = 0
-    self.position0 = 0
-    self.position1 = 0
-    self.velocity0 = 0
-    self.velocity1 = 0
-    self.current0 = 0
-    self.current1 = 0
-    self.is_enabled0 = 0
-    self.is_enabled1= 0
-    self.is_ready0 = 0
-    self.is_ready1 = 0
-    self.has_index_been_detected0 = 0
-    self.has_index_been_detected1 = 0
-    self.index_toggle_bit0 = 0
-    self.index_toggle_bit1 = 0
 
-    self.EI1OC = 1 if absolutePositionMode else 0
-    self.EI2OC = 1 if absolutePositionMode else 0
-
-    self.iSatCurrent0 = 5.0
-    self.iSatCurrent1 = 5.0
+    self.position    = [0, 0]
+    self.velocity    = [0, 0]
+    self.current     = [0, 0]    
+    self.is_enabled  = [0, 0]    
+    self.is_ready    = [0, 0]
+    self.iSatCurrent = [5.0, 5.0]
+    
+    self.has_index_been_detected = [0, 0]
+    self.index_toggle_bit        = [0, 0]
+    self.EIOC                    = [1] * 2 if absolutePositionMode else [0] * 2
 
     self.alpha = [0.] * (2 * 4 * self.connected_boards)
     self.beta = [0., 0.]
@@ -77,23 +68,23 @@ class SPIuDriver:
     # Wait for system enable:
     if waitForInit:
       print(">> Calibrating motor, please wait")
-      while(not self.is_ready0):
+      while(not self.is_ready[0]):
         self.transfer()
         time.sleep(0.001)
     
     if absolutePositionMode:
-      if (not self.has_index_been_detected0 or not self.has_index_been_detected1):
+      if (not self.has_index_been_detected[0] or not self.has_index_been_detected[1]):
           print(">> Waiting for index pulse to have absolute position reference, please move the motors manualy")
           displayedIndex0 = False
           displayedIndex1 = False
           
-          while(not self.has_index_been_detected0 or not self.has_index_been_detected1):
+          while(not self.has_index_been_detected[0] or not self.has_index_been_detected[1]):
             self.transfer()
-            if self.has_index_been_detected0 == True and displayedIndex0 == False:
+            if self.has_index_been_detected[0] == True and displayedIndex0 == False:
                 print (" >> Index 0 detected!")
                 displayedIndex0 = True
 
-            if self.has_index_been_detected1 == True and displayedIndex1 == False:
+            if self.has_index_been_detected[1] == True and displayedIndex1 == False:
                 print (" >> Index 1 detected!")
                 displayedIndex1 = True
             
@@ -107,16 +98,13 @@ class SPIuDriver:
     EM1 = 1	
     EM2	= 1
     EPRE = 1
-    EI1OC = self.EI1OC
-    EI2OC	= self.EI2OC
+    EI1OC = self.EIOC[0]
+    EI2OC	= self.EIOC[1]
     mode = (ES << 7) | (EM1 << 6) | (EM2<<5)|(EPRE<<4)|(EI1OC<<3)|(EI2OC<<2)
     timeout = self.timeout
 
-    rawIsat0 = int(self.iSatCurrent0 * (1 << 3))
-    rawIsat1 = int(self.iSatCurrent1 * (1 << 3))
-
-    rawBeta0  = int(self.beta[0] * (1 << 10))
-    rawBeta1  = int(self.beta[1] * (1 << 10))
+    rawIsat0 = int(self.iSatCurrent[0] * (1 << 3))
+    rawIsat1 = int(self.iSatCurrent[1] * (1 << 3))
 
     header_values = [
         # Mode + Timeout 16 bits:
@@ -174,34 +162,32 @@ class SPIuDriver:
 
     # Decode received sensor packet
     data = struct.unpack(">H H i i h h h h xxxxxxxxxxxxxx", sensorPacket)
-    self.is_system_enabled        = data[0]&0b1000000000000000 != 0
-    self.is_enabled0              = data[0]&0b0100000000000000 != 0
-    self.is_ready0                = data[0]&0b0010000000000000 != 0
-    self.is_enabled1              = data[0]&0b0001000000000000 != 0
-    self.is_ready1                = data[0]&0b0000100000000000 != 0
-    self.has_index_been_detected0 = data[0]&0b0000010000000000 != 0
-    self.has_index_been_detected1 = data[0]&0b0000001000000000 != 0
+    self.is_system_enabled          = data[0]&0b1000000000000000 != 0
+    self.is_enabled[0]              = data[0]&0b0100000000000000 != 0
+    self.is_ready[0]                = data[0]&0b0010000000000000 != 0
+    self.is_enabled[1]              = data[0]&0b0001000000000000 != 0
+    self.is_ready[1]                = data[0]&0b0000100000000000 != 0
+    self.has_index_been_detected[0] = data[0]&0b0000010000000000 != 0
+    self.has_index_been_detected[1] = data[0]&0b0000001000000000 != 0
 
     self.error             = data[0]&0b0000000000001111
-    self.position0 = data[2] / (1<<24) * 2.0 * pi
-    self.position1 = data[3] / (1<<24) * 2.0 * pi
-    self.velocity0 = data[4] / (1<<11) * 2000*pi/60.0
-    self.velocity1 = data[5] / (1<<11) * 2000*pi/60.0
-    self.current0 = data[6]  / (1<<10)
-    self.current1 = data[7]  / (1<<10)
+    self.position[0] = data[2] / (1<<24) * 2.0 * pi
+    self.position[1] = data[3] / (1<<24) * 2.0 * pi
+    self.velocity[0] = data[4] / (1<<11) * 2000*pi/60.0
+    self.velocity[1] = data[5] / (1<<11) * 2000*pi/60.0
+    self.current[0]  = data[6]  / (1<<10)
+    self.current[1]  = data[7]  / (1<<10)
     
     if self.error!=0:
         raise Exception(f"Error from motor driver: Error {self.error}")
    
   def stop(self):
-        self.EI1OC = 0
-        self.EI2OC = 0
+        self.EIOC[0] = self.EIOC[1] = 0
 
         self.alpha = [0.] * (2 * 4 * self.connected_boards)
         self.beta = [0., 0.]
    
-        self.iSatCurrent0 = 0
-        self.iSatCurrent1 = 0
+        self.iSatCurrent[0] = self.iSatCurrent[1] = 0
         self.timeout = 0
 
         dt=0.001
