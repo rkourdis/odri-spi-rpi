@@ -45,7 +45,7 @@ class SPIuDriver:
         self.spi = spidev.SpiDev()
         self.spi.open(spi_bus, 0)
         self.spi.mode=0
-        self.spi.max_speed_hz = 8000000
+        self.spi.max_speed_hz = 16000000
 
         # Allocate all variables
         self.is_system_enabled = 0
@@ -208,83 +208,58 @@ class SharedCommand:
         self.alpha       = multiproc.RawArray("f",  2 * 4 * connected_boards)
         self.beta        = multiproc.RawArray("f",  2)
         self.iSatCurrent = multiproc.RawArray("f",  2)
-
-        self.lock = multiproc.Lock()
-
-class BackgroundSPIuDriver:
+        
+class ParalleluDriver:
     @classmethod
-    def _subprocess_loop(_, dt, ready_flag, quit_flag, state, command, spi_args,):
+    def _subprocess_loop(_, flags, state, command, spi_args,):
         ud = SPIuDriver(**spi_args)
-        ready_flag.value = True
-
-        LOOP_TIME_HIST_SZ = 100
-        cur_loop_time_idx = -1
-        loop_time_hist = [math.nan] * LOOP_TIME_HIST_SZ 
+        flags["ready"].value = True
 
         _outer_quit = False
 
         try:
-            t_loop = time.perf_counter()
-
             while True:
-                if quit_flag.value:
+                if flags["quit"].value:
                     _outer_quit = True
                     raise Exception()
-                
-                # This block should ideally not take long, just
-                # until the controller finishes writing the command:
-                with command.lock:
-                    ud.alpha       = command.alpha[:]
-                    ud.beta        = command.beta[:]
-                    ud.iSatCurrent = command.iSatCurrent[:]
+
+                if not flags["transfer"].value:
+                    continue
+
+                ud.alpha       = command.alpha[:]
+                ud.beta        = command.beta[:]
+                ud.iSatCurrent = command.iSatCurrent[:]
 
                 ud.transfer()
-
                 x_current = ud.position + ud.velocity
 
-                # Same for this:
-                with state.get_lock():
-                    state[:] = x_current
-
-                cur_loop_time_idx += 1
-                if (cur_loop_time_idx == LOOP_TIME_HIST_SZ):
-                    cur_loop_time_idx = 0
-
-                loop_time_hist[cur_loop_time_idx] = time.perf_counter() - t_loop
-
-                t_loop += dt
-                while time.perf_counter() < t_loop:
-                    pass
+                state[:] = x_current
+                flags["transfer"].value = False
 
         except (KeyboardInterrupt, Exception) as ex:
             ud.stop()
-
-            print(
-                colored(
-                    f"Average SPI {spi_args['spi_bus']} loop time (ms): {statistics.mean(loop_time_hist) * 1e+3 :.2f}",
-                    "yellow"
-                )
-            )
+            print(colored(f"Quit bus {spi_args['spi_bus']}.", "yellow"))
 
             if not _outer_quit and not isinstance(ex, KeyboardInterrupt):
                 raise
 
-    def __init__(self, dt, **kwargs):
-        self._quit = multiproc.Value('b', False)
-        ready_flag = multiproc.Value('b', False)
+    def __init__(self, **kwargs):
+        self.synched_flags = {
+            "quit":     multiproc.Value('b', False),     # Stop SPI subprocess
+            "transfer": multiproc.Value('b', False),     # Trigger SPI transfer, False when done
+            "ready":    multiproc.Value('b', False),     # Board ready
+        }
 
-        self._state = multiproc.Array('f', 4)
+        self.state   = multiproc.RawArray('f', 4)        # NOTE: These aren't locked
         self.command = SharedCommand(kwargs["connected_boards"])
 
         self.proc = multiproc.Process(
             target = self._subprocess_loop,
             kwargs = {
-                "dt": dt,
                 "spi_args": kwargs,
-                "ready_flag": ready_flag,
-                "quit_flag": self._quit,
+                "flags": self.synched_flags,
                 "command": self.command,
-                "state": self._state,
+                "state": self.state,
             }
         )
 
@@ -294,18 +269,13 @@ class BackgroundSPIuDriver:
         while True:
             if not self.alive:
                 raise Exception("Could not initialize board!")
-            
-            if ready_flag.value:
+
+            if self.synched_flags["ready"].value:
                 break
-            
+
     @property
     def alive(self):
         return self.proc.is_alive()
-    
-    @property
-    def state(self):
-        with self._state.get_lock():
-            return list(self._state)
 
     def stop(self):
-        self._quit.value = True
+        self.synched_flags["quit"].value = True
