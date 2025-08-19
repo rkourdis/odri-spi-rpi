@@ -11,6 +11,7 @@ import copy
 import time
 import struct
 import spidev
+import signal
 import statistics
 
 from math import pi
@@ -212,6 +213,9 @@ class SharedCommand:
 class ParalleluDriver:
     @classmethod
     def _subprocess_loop(_, flags, state, command, spi_args,):
+        # Ignore Ctrl+C signals, the parent process should stop us:
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
+
         ud = SPIuDriver(**spi_args)
         flags["ready"].value = True
 
@@ -261,7 +265,7 @@ class ParalleluDriver:
                 "flags": self.synched_flags,
                 "command": self.command,
                 "state": self.state,
-            }
+            },
         )
 
         self.proc.start()
