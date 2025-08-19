@@ -232,7 +232,7 @@ class ParalleluDriver:
                     raise Quit()
 
                 if not flags["transfer"].value:
-                    continue
+                    time.sleep(0.0001)
 
                 ud.alpha       = command.alpha[:]
                 ud.beta        = command.beta[:]
