@@ -217,11 +217,15 @@ class ParalleluDriver:
 
         _outer_quit = False
 
+        class Quit(Exception):
+            def __init__(self, *args):
+                super().__init__(*args)
+
         try:
             while True:
                 if flags["quit"].value:
                     _outer_quit = True
-                    raise Exception()
+                    raise Quit()
 
                 if not flags["transfer"].value:
                     continue
@@ -238,16 +242,13 @@ class ParalleluDriver:
 
         except (KeyboardInterrupt, Exception) as ex:
             ud.stop()
-            print(colored(f"Quit bus {spi_args['spi_bus']}.", "yellow"))
-
-            if not _outer_quit and not isinstance(ex, KeyboardInterrupt):
-                raise
+            print(colored(f"Exception {type(ex).__name__} on bus {spi_args['spi_bus']}.", "yellow"))
 
     def __init__(self, **kwargs):
         self.synched_flags = {
-            "quit":     multiproc.Value('b', False),     # Stop SPI subprocess
-            "transfer": multiproc.Value('b', False),     # Trigger SPI transfer, False when done
-            "ready":    multiproc.Value('b', False),     # Board ready
+            "quit":     multiproc.Value('b', False, lock = False),     # Stop SPI subprocess
+            "transfer": multiproc.Value('b', False),                   # Trigger SPI transfer, False when done
+            "ready":    multiproc.Value('b', False),                   # Board ready
         }
 
         self.state   = multiproc.RawArray('f', 4)        # NOTE: These aren't locked
