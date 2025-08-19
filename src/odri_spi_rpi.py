@@ -279,3 +279,6 @@ class ParalleluDriver:
 
     def stop(self):
         self.synched_flags["quit"].value = True
+
+        while self.alive():
+            pass
